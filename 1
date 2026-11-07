@@ -1,0 +1,320 @@
+
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  NoSubscriberBehavior,
+  StreamType,
+  AudioPlayerStatus
+} = require("@discordjs/voice");
+
+const youtubedl = require("youtube-dl-exec");
+const ffmpegPath = require("ffmpeg-static");
+const { spawn } = require("child_process");
+
+const sessions = new Map();
+
+function getSession(voiceChannel) {
+  const guildId = voiceChannel.guild.id;
+
+  if (sessions.has(guildId)) {
+    return sessions.get(guildId);
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator
+  });
+
+  const player = createAudioPlayer({
+    behaviors: {
+      noSubscriber: NoSubscriberBehavior.Pause
+    }
+  });
+
+  const session = {
+    connection,
+    player,
+    queue: [],
+    seen: new Set(),
+    searchTerm: "",
+    lastTitle: "",
+    current: null,
+    busy: false,
+    retryTimer: null,
+    stopped: false
+  };
+
+  sessions.set(guildId, session);
+
+  player.on(AudioPlayerStatus.Idle, () => {
+    if (session.stopped || !session.current) return;
+
+    console.log("Трек закончился. Ищу следующий.");
+    cleanupCurrent(session);
+    startNext(session);
+  });
+
+  player.on("error", error => {
+    console.error("Ошибка аудиоплеера:", error.message);
+    cleanupCurrent(session);
+    startNext(session);
+  });
+
+  connection.on("error", error => {
+    console.error("Ошибка голосового соединения:", error.message);
+  });
+
+  return session;
+}
+
+function cleanupCurrent(session) {
+  const current = session.current;
+  if (!current) return;
+
+  clearTimeout(current.timer);
+
+  if (current.downloader && current.downloader.exitCode === null) {
+    current.downloader.kill();
+  }
+
+  if (current.ffmpeg && current.ffmpeg.exitCode === null) {
+    current.ffmpeg.kill();
+  }
+
+  session.current = null;
+}
+
+async function searchTracks(term) {
+  const result = await youtubedl(`scsearch10:${term}`, {
+    dumpSingleJson: true,
+    noWarnings: true,
+    noPlaylist: true
+  });
+
+  return result.entries || [];
+}
+
+async function fillQueue(session) {
+  const terms = [
+    session.lastTitle,
+    session.searchTerm
+  ].filter(Boolean);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt === 2) {
+      session.seen.clear();
+    }
+
+    for (const term of terms) {
+      try {
+        const tracks = await searchTracks(term);
+
+        for (const track of tracks) {
+          const url = track.webpage_url || track.url;
+
+          if (url && !session.seen.has(url)) {
+            session.seen.add(url);
+            session.queue.push(track);
+          }
+        }
+      } catch (error) {
+        console.log("Ошибка поиска:", error.message);
+      }
+    }
+
+    if (session.queue.length) return true;
+  }
+
+  return false;
+}
+
+async function startNext(session) {
+  if (session.busy || session.current || session.stopped) return;
+
+  session.busy = true;
+
+  try {
+    while (!session.stopped) {
+      if (!session.queue.length) {
+        console.log("Ищу похожие песни...");
+
+        const found = await fillQueue(session);
+
+        if (!found) {
+          console.log("Песни пока не найдены. Повтор через 30 секунд.");
+
+          session.busy = false;
+
+          session.retryTimer = setTimeout(() => {
+            startNext(session);
+          }, 30000);
+
+          return;
+        }
+      }
+
+      const track = session.queue.shift();
+      const source = track.webpage_url || track.url;
+
+      if (!source) continue;
+
+      console.log("Пробую трек:", track.title);
+
+      const downloader = youtubedl.exec(source, {
+        format: "bestaudio",
+        output: "-",
+        noWarnings: true,
+        noPlaylist: true
+      });
+
+      const ffmpeg = spawn(ffmpegPath, [
+        "-i", "pipe:0",
+        "-f", "s16le",
+        "-ar", "48000",
+        "-ac", "2",
+        "-vn",
+        "pipe:1"
+      ]);
+
+      downloader.stdout.pipe(ffmpeg.stdin);
+
+      const current = {
+        downloader,
+        ffmpeg,
+        timer: null,
+        title: track.title || "Неизвестный трек"
+      };
+
+      session.current = current;
+
+      let started = false;
+
+      const fail = error => {
+        if (session.current !== current || started) return;
+
+        console.log("Пропускаю трек:", error.message);
+
+        cleanupCurrent(session);
+        session.player.stop(true);
+        startNext(session);
+      };
+
+      current.timer = setTimeout(() => {
+        fail(new Error("Не удалось начать воспроизведение за 20 секунд"));
+      }, 20000);
+
+      downloader.on("error", fail);
+      ffmpeg.on("error", fail);
+
+      downloader.on("close", code => {
+        if (!started && code !== 0) {
+          fail(new Error("Ошибка загрузки трека"));
+        }
+      });
+
+      ffmpeg.on("close", code => {
+        if (!started && code !== 0) {
+          fail(new Error("Ошибка FFmpeg"));
+        }
+      });
+
+      const resource = createAudioResource(ffmpeg.stdout, {
+        inputType: StreamType.Raw
+      });
+
+      resource.playStream.once("data", () => {
+        if (session.current !== current) return;
+
+        started = true;
+        clearTimeout(current.timer);
+
+        session.lastTitle = current.title;
+        console.log("Сейчас играет:", current.title);
+      });
+
+      session.connection.subscribe(session.player);
+      session.player.play(resource);
+
+      session.busy = false;
+      return;
+    }
+  } catch (error) {
+    console.error("Ошибка воспроизведения:", error.message);
+    cleanupCurrent(session);
+    session.busy = false;
+
+    setTimeout(() => startNext(session), 3000);
+    return;
+  }
+
+  session.busy = false;
+}
+
+async function playTrack(voiceChannel, query) {
+  if (!ffmpegPath) {
+    throw new Error("FFmpeg не найден");
+  }
+
+  const session = getSession(voiceChannel);
+
+  session.stopped = false;
+  session.searchTerm = query;
+  session.lastTitle = query;
+  session.queue = [];
+  session.seen.clear();
+
+  if (query.startsWith("http")) {
+    try {
+      const info = await youtubedl(query, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        noPlaylist: true
+      });
+
+      session.searchTerm = info.title || query;
+      session.queue.push(info);
+
+      const similar = await searchTracks(session.searchTerm);
+
+      for (const track of similar) {
+        const url = track.webpage_url || track.url;
+
+        if (url && !session.seen.has(url)) {
+          session.seen.add(url);
+          session.queue.push(track);
+        }
+      }
+    } catch (error) {
+      console.log("Исходный трек недоступен:", error.message);
+    }
+  } else {
+    session.queue = await searchTracks(query);
+
+    for (const track of session.queue) {
+      const url = track.webpage_url || track.url;
+      if (url) session.seen.add(url);
+    }
+  }
+
+  if (!session.queue.length) {
+    throw new Error("Не удалось найти подходящие треки");
+  }
+
+  const first = session.queue.shift();
+
+  session.queue.unshift(first);
+  session.busy = false;
+
+  await startNext(session);
+
+  return {
+    title: first.title || query
+  };
+}
+
+module.exports = {
+  playTrack,
+  getPlayer: guild => sessions.get(guild.id)?.player
+};
